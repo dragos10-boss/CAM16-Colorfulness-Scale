@@ -1,0 +1,178 @@
+// CAM16 Colorfulness Scale (DWG / DaVinci Intermediate)
+//
+// A hue- and lightness-preserving saturation control built on the CAM16 color appearance model
+// (Li et al. 2017; standardized by the CIE as CIECAM16, CIE 248:2022).
+//
+// Input and output: DaVinci Wide Gamut / DaVinci Intermediate. Place it after the camera IDT
+// (any camera, as long as the IDT outputs DWG / DI) and before the final CST.
+//
+// What it does, per pixel:
+//   1. converts to CAM16 lightness J, colorfulness M and hue h;
+//   2. multiplies M by the Saturation value, leaving J and h unchanged, so every color gets the
+//      same relative colorfulness boost, up to the edge of the export gamut;
+//   3. near the edge of the chosen "Export gamut", compresses M smoothly (ACES RGC-style curve
+//      whose limit is the Saturation value, so the most saturated in-gamut color lands exactly on
+//      the edge); colors that were already outside the gamut are moved onto the edge, again with
+//      the same J and h, so the CST does not have to clip them and shift their hue;
+//   4. converts back to DWG / DI.
+//
+// Export gamut: set it to the output gamut of your final CST. DCI-P3 uses the DCI white and is
+// checked against Bradford, CAT02 and CAT16 adaptation at once (the method the CST uses is not
+// documented), so the result fits whichever it uses. If "Use White Point Adaptation" is off in
+// the CST, choose P3-D65 instead (same gamut edge).
+// Only the lower gamut edge (negative channels) is handled; values above 1.0 (bright
+// highlights) are left to the tone mapping of the CST.
+//
+// Show compressed area: paints the pixels whose boost is reduced by more than 2% magenta.
+// At Saturation 1.00 the image is unchanged, except for colors outside the export gamut.
+// Fixed CAM16 viewing conditions: La = 40 cd/m2, dim surround, Yb = 20, full adaptation to D65.
+
+DEFINE_UI_PARAMS(p_Sat, Saturation, DCTLUI_SLIDER_FLOAT, 1.38, 1.0, 1.8, 0.01)
+DEFINE_UI_PARAMS(p_Gamut, Export gamut, DCTLUI_COMBO_BOX, 3, {G_709, G_P3D65, G_DCIP3, G_2020}, {Rec.709 (sRGB), P3-D65, DCI-P3, Rec.2020})
+DEFINE_UI_PARAMS(p_Show, Show compressed area, DCTLUI_CHECK_BOX, 0)
+
+__CONSTANT__ float FWD[9] = { 4.761079914e+01f, 6.507177970e+01f, -1.268435912e+01f, 1.478362490e+01f, 9.923154308e+01f, -1.401379408e+01f, -7.592598086e+00f, -8.202208188e+00f, 1.158148202e+02f };
+__CONSTANT__ float INV[9] = { 2.650961826e-02f, -1.731708003e-02f, 8.080099275e-04f, -3.741418080e-03f, 1.262328538e-02f, 1.117668975e-03f, 1.472946092e-03f, -2.412714884e-04f, 8.766600395e-03f };
+// cone signals -> RGB of the export gamut: Rec.709, P3-D65, DCI-P3 x3 (Bradford, CAT02, CAT16), Rec.2020
+__CONSTANT__ float TOT[54] = { 5.313864000e-02f, -4.285265157e-02f, -2.843967447e-04f, -1.052103111e-02f, 2.179867890e-02f, -1.277878832e-03f, 7.605883135e-05f, -2.226922013e-03f, 1.214846375e-02f, 4.183662732e-02f, -3.137458164e-02f, -4.607775987e-04f, -8.407899331e-03f, 1.965262978e-02f, -1.244900990e-03f, 2.153051202e-04f, -1.181524333e-03f, 1.096404495e-02f, 4.479897407e-02f, -3.441624785e-02f, -3.813795008e-04f, -8.283539616e-03f, 1.947794515e-02f, -1.194581525e-03f, 2.131769001e-04f, -1.201494918e-03f, 1.098613957e-02f, 4.526027253e-02f, -3.487841590e-02f, -3.804955283e-04f, -8.270471397e-03f, 1.951138359e-02f, -1.241079114e-03f, 2.695917132e-04f, -1.360420778e-03f, 1.108863329e-02f, 4.500134788e-02f, -3.455586761e-02f, -4.441154698e-04f, -7.932027046e-03f, 1.898420254e-02f, -1.052366911e-03f, 2.437825853e-04f, -1.369827854e-03f, 1.112384211e-02f, 2.987828701e-02f, -1.980444014e-02f, -7.302824182e-05f, -6.001912917e-03f, 1.705846075e-02f, -1.056677572e-03f, 1.314594733e-05f, -7.782635659e-04f, 1.076297445e-02f };
+
+#define FL 5.848035714e-01f
+#define FL4 8.744852811e-01f
+#define NBB 1.000304005e+00f
+#define AW 3.488126050e+01f
+#define CZ 1.137056021e+00f
+#define NC 9.000000000e-01f
+#define CK 8.952178848e-01f
+#define RA_MAX 3.600000000e+02f
+#define T0 8.000000000e-01f
+#define PW 1.200000000e+00f
+
+__DEVICE__ float di_to_lin(float y) {
+    if (y > 2.740668000e-02f) return _exp2f(y / 7.329248000e-02f - 7.000000000e+00f) - 7.500000000e-03f;
+    return y / 1.044426855e+01f;
+}
+__DEVICE__ float lin_to_di(float x) {
+    if (x > 2.624090000e-03f) return (_log2f(x + 7.500000000e-03f) + 7.000000000e+00f) * 7.329248000e-02f;
+    return x * 1.044426855e+01f;
+}
+__DEVICE__ float adapt(float x) {
+    float y = _powf(FL * _fabs(x) / 100.0f, 0.42f);
+    float r = 400.0f * y / (y + 27.13f);
+    return (x < 0.0f ? -r : r) + 0.1f;
+}
+__DEVICE__ float unadapt(float ra) {
+    float y = ra - 0.1f;
+    float ay = _fminf(_fabs(y), 399.999f);
+    float r = (100.0f / FL) * _powf((27.13f * ay) / (400.0f - ay), 1.0f / 0.42f);
+    return y < 0.0f ? -r : r;
+}
+
+// forward: DWG linear -> J, M, h
+__DEVICE__ float3 cam_fwd(float r0, float g0, float b0) {
+    float r = adapt(FWD[0] * r0 + FWD[1] * g0 + FWD[2] * b0);
+    float g = adapt(FWD[3] * r0 + FWD[4] * g0 + FWD[5] * b0);
+    float b = adapt(FWD[6] * r0 + FWD[7] * g0 + FWD[8] * b0);
+    float a = r - 12.0f * g / 11.0f + b / 11.0f;
+    float bb = (r + g - 2.0f * b) / 9.0f;
+    float h = _atan2f(bb, a);
+    float et = 0.25f * (_cosf(h + 2.0f) + 3.8f);
+    float A = (2.0f * r + g + 0.05f * b - 0.305f) * NBB;
+    float J = 100.0f * _powf(_fmaxf(A, 0.0f) / AW, CZ);
+    float den = r + g + 1.05f * b;
+    float t = den > 1e-9f ? (50000.0f / 13.0f * NC * NBB * et * _sqrtf(a * a + bb * bb)) / den : 0.0f;
+    float C = _powf(t, 0.9f) * _sqrtf(J / 100.0f) * CK;
+    return make_float3(J, C * FL4, h);
+}
+
+__DEVICE__ int finite3(float3 v) {
+    return (v.x == v.x) && (v.y == v.y) && (v.z == v.z) && _fabs(v.x) < 1e30f && _fabs(v.y) < 1e30f && _fabs(v.z) < 1e30f;
+}
+
+// inverse: J, M, h -> adapted cone responses
+__DEVICE__ float3 cam_inv_ra(float J, float M, float h) {
+    float C = M / FL4;
+    float t = _powf(C / (_sqrtf(_fmaxf(J, 1e-9f) / 100.0f) * CK), 1.0f / 0.9f);
+    float et = 0.25f * (_cosf(h + 2.0f) + 3.8f);
+    float A = AW * _powf(J / 100.0f, 1.0f / CZ);
+    float p2 = A / NBB + 0.305f;
+    float p3 = 1.05f;
+    float sh = _sinf(h), ch = _cosf(h);
+    float a = 0.0f, b = 0.0f;
+    if (t > 1e-12f) {
+        float p1 = (50000.0f / 13.0f * NC * NBB * et) / t;
+        if (_fabs(sh) >= _fabs(ch)) {
+            b = p2 * (2.0f + p3) * (460.0f / 1403.0f) / (p1 / sh + (2.0f + p3) * (220.0f / 1403.0f) * (ch / sh) - 27.0f / 1403.0f + p3 * (6300.0f / 1403.0f));
+            a = b * ch / sh;
+        } else {
+            a = p2 * (2.0f + p3) * (460.0f / 1403.0f) / (p1 / ch + (2.0f + p3) * (220.0f / 1403.0f) - (27.0f / 1403.0f - p3 * (6300.0f / 1403.0f)) * (sh / ch));
+            b = a * sh / ch;
+        }
+    }
+    return make_float3((460.0f * p2 + 451.0f * a + 288.0f * b) / 1403.0f,
+                       (460.0f * p2 - 891.0f * a - 261.0f * b) / 1403.0f,
+                       (460.0f * p2 - 220.0f * a - 6300.0f * b) / 1403.0f);
+}
+
+__DEVICE__ int is_valid(float J, float M, float h, int m0, int m1) {
+    float3 ra = cam_inv_ra(J, M, h);
+    if (!finite3(ra)) return 0;
+    float3 rc = make_float3(unadapt(ra.x), unadapt(ra.y), unadapt(ra.z));
+    if (!finite3(rc)) return 0;
+    if (_fmaxf(_fabs(ra.x - 0.1f), _fmaxf(_fabs(ra.y - 0.1f), _fabs(ra.z - 0.1f))) >= RA_MAX) return 0;
+    for (int m = m0; m < m1; m++) {
+        int o = m * 9;
+        float r = TOT[o + 0] * rc.x + TOT[o + 1] * rc.y + TOT[o + 2] * rc.z;
+        float g = TOT[o + 3] * rc.x + TOT[o + 4] * rc.y + TOT[o + 5] * rc.z;
+        float b = TOT[o + 6] * rc.x + TOT[o + 7] * rc.y + TOT[o + 8] * rc.z;
+        if (!(r >= 0.0f && g >= 0.0f && b >= 0.0f)) return 0;
+    }
+    return 1;
+}
+
+// x = k*M/Mb. Identity below T0; maps [T0, k] onto [T0, 1] (ACES RGC-style curve whose limit is k);
+// capped at 1 beyond k (colors that were already outside the export gamut)
+__DEVICE__ float soft(float x, float k) {
+    if (k <= 1.001f) return _fminf(x, 1.0f);
+    if (x <= T0) return x;
+    float scl = (k - T0) / _powf(_powf((1.0f - T0) / (k - T0), -PW) - 1.0f, 1.0f / PW);
+    float d = (x - T0) / scl;
+    return _fminf(T0 + scl * d / _powf(1.0f + _powf(d, PW), 1.0f / PW), 1.0f);
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B) {
+    int m0 = 5, m1 = 6;
+    if (p_Gamut == G_709) { m0 = 0; m1 = 1; }
+    else if (p_Gamut == G_P3D65) { m0 = 1; m1 = 2; }
+    else if (p_Gamut == G_DCIP3) { m0 = 2; m1 = 5; }
+    float k = _fmaxf(p_Sat, 1.0f);
+    float r0 = di_to_lin(p_R), g0 = di_to_lin(p_G), b0 = di_to_lin(p_B);
+    if (!(_fmaxf(r0, _fmaxf(g0, b0)) > 0.0f)) return make_float3(p_R, p_G, p_B);
+    float3 jmh = cam_fwd(r0, g0, b0);
+    float J = jmh.x, M = jmh.y, h = jmh.z;
+    if (!(M > 1e-4f) || !(J > 1e-4f) || !(M < 1e30f)) return make_float3(p_R, p_G, p_B);
+    float Mt = M * k;
+    float Mout = Mt;
+    int compressed = 0;
+    if (!is_valid(J, Mt / T0, h, m0, m1)) {
+        // Mb = largest M still inside the export gamut (and the model's valid range): bisection
+        float lo = 0.0f, hi = Mt / T0;
+        for (int i = 0; i < 16; i++) {
+            float mid = 0.5f * (lo + hi);
+            if (is_valid(J, mid, h, m0, m1)) lo = mid; else hi = mid;
+        }
+        if (lo == 0.0f && !is_valid(J, 0.0f, h, m0, m1)) return make_float3(p_R, p_G, p_B);
+        // in-gamut colors never lose colorfulness; colors already outside go onto the edge
+        Mout = _fmaxf(_fminf(M, lo), lo * soft(Mt / _fmaxf(lo, 1e-12f), k));
+        compressed = (Mout < 0.98f * Mt) ? 1 : 0;
+    }
+    if (!(_fabs(Mout - M) > 1e-6f * M)) return make_float3(p_R, p_G, p_B);
+    float3 ra = cam_inv_ra(J, Mout, h);
+    float3 rc = make_float3(unadapt(ra.x), unadapt(ra.y), unadapt(ra.z));
+    float r = INV[0] * rc.x + INV[1] * rc.y + INV[2] * rc.z;
+    float g = INV[3] * rc.x + INV[4] * rc.y + INV[5] * rc.z;
+    float b = INV[6] * rc.x + INV[7] * rc.y + INV[8] * rc.z;
+    float3 o = make_float3(lin_to_di(r), lin_to_di(g), lin_to_di(b));
+    if (!finite3(o)) return make_float3(p_R, p_G, p_B);
+    if (p_Show && compressed) return make_float3(1.0f, 0.0f, 1.0f);
+    return o;
+}
